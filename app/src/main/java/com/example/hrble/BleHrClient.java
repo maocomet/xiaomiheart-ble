@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.BluetoothStatusCodes;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanRecord;
@@ -455,14 +456,18 @@ public class BleHrClient {
 
         boolean queued;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            queued = g.writeDescriptor(cccd, value);
+            // Careful: the API 33+ overload returns a BluetoothStatusCodes int,
+            // unlike the deprecated boolean-returning single-argument form.
+            int status = g.writeDescriptor(cccd, value);
+            queued = (status == BluetoothStatusCodes.SUCCESS);
+            Log.i(TAG, "writeDescriptor(CCCD, " + (supportsNotify ? "NOTIFY" : "INDICATE")
+                    + ", len=" + value.length + ") -> status=" + status);
         } else {
             cccd.setValue(value);
             queued = g.writeDescriptor(cccd);
+            Log.i(TAG, "writeDescriptor(CCCD, " + (supportsNotify ? "NOTIFY" : "INDICATE")
+                    + ") -> " + queued);
         }
-
-        Log.i(TAG, "writeDescriptor(CCCD, " + (supportsNotify ? "NOTIFY" : "INDICATE")
-                + ") -> " + queued);
         if (!queued) {
             listener.onConnectionState("CCCD write could not be queued");
         }
