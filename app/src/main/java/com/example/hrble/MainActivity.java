@@ -50,6 +50,7 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
     private EditText urlInput;
     private EditText tokenInput;
     private TextView uploadStatusView;
+    private TextView calibrationView;
     private ListView candidateList;
     private ArrayAdapter<String> candidateAdapter;
 
@@ -137,15 +138,28 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
             uploader.submitTest();
         });
 
+        Button calibrateButton = new Button(this);
+        calibrateButton.setText("Calibrate");
+        calibrateButton.setOnClickListener(v -> {
+            applyUploadConfig();
+            calibrationView.setText("calibrating...");
+            uploader.calibrate();
+        });
+
         LinearLayout uploadButtons = new LinearLayout(this);
         uploadButtons.setOrientation(LinearLayout.HORIZONTAL);
         uploadButtons.addView(saveButton, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         uploadButtons.addView(testButton, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        uploadButtons.addView(calibrateButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         uploadStatusView = new TextView(this);
         uploadStatusView.setTextSize(12);
+
+        calibrationView = new TextView(this);
+        calibrationView.setTextSize(12);
 
         root.addView(scanStateView);
         root.addView(candidateList, new LinearLayout.LayoutParams(
@@ -161,6 +175,7 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         root.addView(tokenInput);
         root.addView(uploadButtons);
         root.addView(uploadStatusView);
+        root.addView(calibrationView);
 
         setContentView(root);
 
@@ -300,6 +315,18 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
             uploadStatusView.setText("upload: " + (ok ? "OK" : "FAILED") + " " + detail
                     + "   [ok=" + uploadOk + " fail=" + uploadFail + "]");
         });
+    }
+
+    @Override
+    public void onCalibrationResult(long clockOffsetMs, long rttMs, long uncertaintyMs) {
+        runOnUiThread(() -> calibrationView.setText(String.format(Locale.US,
+                "clock_offset = %d ms (%+.2f s)\nrtt = %d ms\nuncertainty = ± %d ms",
+                clockOffsetMs, clockOffsetMs / 1000.0, rttMs, uncertaintyMs)));
+    }
+
+    @Override
+    public void onCalibrationFailed(String detail) {
+        runOnUiThread(() -> calibrationView.setText("calibration failed: " + detail));
     }
 
     // ------------------------------------------------------------------ lifecycle

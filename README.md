@@ -151,6 +151,32 @@ reading. The status line shows the last HTTP code plus running ok/fail counts.
 > `SharedPreferences` is app-private but not encrypted. That is fine for a PoC on a
 > non-rooted device; use `EncryptedSharedPreferences` if that is not good enough.
 
+## Clock calibration
+
+`sent_at - measured_at` and `received_at - sent_at` split the total delay in two, but they
+still cannot say whether a large second value is a slow network or a phone clock that is
+offset from the server's. **Calibrate** settles it with a bounded error.
+
+The app brackets a `GET /wearable/time` call with its own timestamps:
+
+```
+t0 = now (before request)
+      → GET /wearable/time  →  {"server_time": "..."}
+t1 = now (after response)
+
+rtt          = t1 - t0
+clock_offset = server_time - (t0 + t1) / 2
+uncertainty  = rtt / 2
+```
+
+`clock_offset` with a small `rtt` is decisive: if the offset is ~22 s while the uncertainty
+is under a second, the phone's clock is genuinely behind. If the offset is near zero, the
+delay is all network.
+
+**This only means anything if the server clock is accurate** — check `timedatectl` reports
+`System clock synchronized: yes`. The endpoint path is derived from the configured upload
+URL (`.../wearable/heart-rate` → `.../wearable/time`) rather than configured separately.
+
 ## Troubleshooting
 
 | Symptom | Meaning |
