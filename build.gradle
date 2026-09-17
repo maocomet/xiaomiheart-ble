@@ -1,0 +1,5 @@
+// Root build file. AGP 8.5.2 works with the JDK 17 already installed on this machine.
+// If Android Studio offers to upgrade AGP, accept — nothing here depends on the version.
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}

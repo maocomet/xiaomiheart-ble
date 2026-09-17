@@ -1,0 +1,33 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    // Deliberately different from the broadcast PoC (com.example.hrpoc) so both
+    // APKs can be installed side by side while comparing the two approaches.
+    namespace 'com.example.hrble'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.hrble"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// No dependencies on purpose: plain android.app.Activity keeps this buildable
+// without AndroidX or any network-resolved artifact beyond the SDK itself.
+dependencies { }

@@ -1,0 +1,131 @@
+# GB HR BLE PoC
+
+Minimal Android app that acts as a **BLE central**, connects **directly to a Mi Band 6**,
+subscribes to the standard Heart Rate Measurement characteristic and logs:
+
+```
+HR=<value> timestamp=<time>
+```
+
+It does **not** go through Gadgetbridge at runtime, does not use the BLE Intent API, and
+performs **no Huami authentication handshake**.
+
+## The question this stage answers
+
+Gadgetbridge's per-device *"3rd party realtime HR access"* setting only writes a vendor
+config command to the band:
+
+```java
+// Gadgetbridge HuamiSupport.setExposeHRThirdParty()
+writeToConfiguration(builder, HuamiService.COMMAND_ENBALE_HR_CONNECTION);
+```
+
+That is supposed to make the **band itself** serve heart rate over standard BLE, so another
+app can connect concurrently. Community reports say no authentication is needed — this PoC
+verifies that. **Deliberately no `auth_key` is used anywhere.** If notifications never
+arrive, that assumption is what failed, and the service map dumped to logcat is the
+evidence.
+
+## Gadgetbridge prerequisites
+
+On the Mi Band 6's device settings, with Gadgetbridge connected at least once:
+
+- **3rd party realtime HR access** → ON
+- **Visible while connected** → ON *(otherwise the band may not be discoverable)*
+
+Do **not** enable the BLE Intent API; this app does not use it.
+
+Heart rate also has to actually be *measured* for anything to arrive — start an activity on
+the band, open its heart-rate screen, or turn on whole-day HR measurement.
+
+## Permissions
+
+| Android | Permissions |
+|---|---|
+| 12+ (API 31+) | `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT` |
+| 6–11 (API 23–30) | `ACCESS_FINE_LOCATION` (+ legacy `BLUETOOTH`, `BLUETOOTH_ADMIN`) |
+
+`BLUETOOTH_SCAN` carries `neverForLocation` — the app makes no location claim, and the
+location permission is kept off Android 12+ entirely.
+
+> If the band never shows up in the scan, the documented fallback is to drop
+> `neverForLocation` and request `ACCESS_FINE_LOCATION` on 12+ as well.
+
+## How a device is chosen
+
+No MAC address is hardcoded. The scan runs **unfiltered** on purpose: a service-UUID
+`ScanFilter` would hide the band entirely if it does not advertise `0x180D`. Candidates are
+ranked client-side instead:
+
+1. advertises the Heart Rate service `0000180d-…`
+2. name looks like a band (`mi band`, `mi smart band`, `xiaomi`, `amazfit`, `zepp`, …)
+3. any other named device
+4. unnamed devices
+
+Tap a row to connect.
+
+## Build
+
+JDK 17, Gradle 8.10.2 (wrapper included), AGP 8.5.2, compileSdk 34, minSdk 26.
+
+```bash
+./gradlew assembleDebug
+# -> app/build/outputs/apk/debug/app-debug.apk
+```
+
+CI builds it on every push and uploads the APK as the **`app-debug-apk`** artifact.
+
+## Run
+
+1. Install the APK and open it. Grant the Bluetooth permissions.
+2. It scans for 20 s automatically. Wait for the list, then tap the band.
+3. Watch the screen and logcat:
+
+```bash
+adb logcat -s HRBLE
+```
+
+Expected on success:
+
+```
+I/HRBLE: onConnectionStateChange status=0 newState=2
+I/HRBLE: service 0000180d-0000-1000-8000-00805f9b34fb  (Heart Rate service)
+I/HRBLE:    char 00002a37-0000-1000-8000-00805f9b34fb  (Heart Rate Measurement)  props=NOTIFY
+I/HRBLE: CCCD write status=0
+I/HRBLE: 0x2A37 payload=0048 [uint16=false contactSupported=true contactDetected=true ...]
+I/HRBLE: HR=72 timestamp=1789618106711
+```
+
+## What the screen shows
+
+Scan state · candidate list · connected device name · connection status · latest BPM ·
+update time · number of notifications received.
+
+The notification counter is the quickest way to tell "subscribed but silent" apart from
+"never subscribed".
+
+## Troubleshooting
+
+| Symptom | Meaning |
+|---|---|
+| No candidates at all | BLE off, permissions denied, or `neverForLocation` filtering — see the fallback above |
+| `status=133` on connect | The notorious generic Android GATT error; usually a stale link. Tap Scan and retry |
+| Connected, `0x180D` not in the service map | "3rd party realtime HR access" was not applied — reconnect the band in Gadgetbridge so the command is pushed |
+| Connected, `0x180D` found, CCCD write OK, **0 notifications** | The band is not measuring (start an activity / enable whole-day HR), **or** this service does require Huami authentication after all |
+| Notifications stop after a while | The band went idle, or Gadgetbridge reconnected and took the link |
+
+In every failure case the app dumps the full service/characteristic map to logcat. It does
+not attempt authentication or any other workaround — that is a deliberate scope boundary
+for this stage.
+
+## Layout
+
+```
+app/src/main/java/com/example/hrble/
+  MainActivity.java    UI + runtime permission flow
+  BleHrClient.java     scan / connect / discoverServices / subscribe / parse dispatch
+  HrParser.java        UUID constants, 0x2A37 flag parsing, pretty-printing
+```
+
+Package is `com.example.hrble`, deliberately different from the broadcast-based PoC
+(`com.example.hrpoc`) so both APKs can be installed side by side while comparing approaches.
