@@ -16,9 +16,36 @@ android {
         versionName "1.0"
     }
 
+    // A pinned signing key, so every build produces an APK that installs over the
+    // previous one. Without it each ephemeral CI runner generates a fresh debug
+    // keystore, the signature changes every run, and Android rejects the upgrade.
+    //
+    // The values are injected as environment variables from GitHub Actions secrets
+    // and are never committed. When they are absent (a plain local build) AGP
+    // falls back to the ordinary debug keystore.
+    def keystorePath = System.getenv("SIGNING_KEYSTORE_PATH")
+    if (keystorePath) {
+        signingConfigs {
+            pinned {
+                storeFile file(keystorePath)
+                storePassword System.getenv("SIGNING_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword System.getenv("SIGNING_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (keystorePath) {
+                signingConfig signingConfigs.pinned
+            }
+        }
         release {
             minifyEnabled false
+            if (keystorePath) {
+                signingConfig signingConfigs.pinned
+            }
         }
     }
 
