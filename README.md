@@ -10,6 +10,34 @@ HR=<value> timestamp=<time>
 It does **not** go through Gadgetbridge at runtime, does not use the BLE Intent API, and
 performs **no Huami authentication handshake**.
 
+## The full chain
+
+This app is one link in a longer path:
+
+```
+Mi Band 6
+  → Android app (this repo, BLE central)
+  → https://funf.maomao.im/wearable/heart-rate    HTTPS POST + Bearer token
+  → wearable receiver     127.0.0.1:18005         keeps the latest reading in memory
+  → funf-mcp              127.0.0.1:18004         read-only, over localhost
+  → https://funf.maomao.im/mcp                    the only MCP entry point
+  → AI
+```
+
+Only the Android link lives in this repository; everything to the right of it is
+documented under [`docs/`](docs/). The rest of this file covers the app itself.
+
+## Documentation
+
+| Document | Covers |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | End-to-end architecture and component boundaries |
+| [docs/SETUP-MIBAND6.md](docs/SETUP-MIBAND6.md) | Migrating the band from the official app to Gadgetbridge |
+| [docs/SERVER-MCP.md](docs/SERVER-MCP.md) | VPS services, HTTP API, and the `get_current_heart_rate` MCP tool |
+| [docs/TIME-CALIBRATION.md](docs/TIME-CALIBRATION.md) | Diagnosing and fixing the ~22 s device clock offset |
+| [docs/SECURITY.md](docs/SECURITY.md) | What must never be committed; signing and credentials |
+| [docs/RECOVERY-CHECKLIST.md](docs/RECOVERY-CHECKLIST.md) | Step-by-step checklist to rebuild the chain from scratch |
+
 ## The question this stage answers
 
 Gadgetbridge's per-device *"3rd party realtime HR access"* setting only writes a vendor
