@@ -5,6 +5,9 @@
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
 
+    <!-- HTTPS POST of each reading to the wearable receiver. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!--
         Android 11 and below: scanning required location permission, and the old
         BLUETOOTH/BLUETOOTH_ADMIN pair. maxSdkVersion keeps them off 12+.

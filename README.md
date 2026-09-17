@@ -104,6 +104,35 @@ update time · number of notifications received.
 The notification counter is the quickest way to tell "subscribed but silent" apart from
 "never subscribed".
 
+## Uploading readings to a server
+
+Each reading can be forwarded by HTTPS POST:
+
+```json
+{"heart_rate": 86, "measured_at": "2026-09-17T07:08:41.789Z", "source": "mi_band_6"}
+```
+
+No MAC, no auth key, nothing else device-identifying is sent.
+
+**Configuration is runtime, not compile-time.** Enter the upload URL and bearer token on
+the app screen and tap **Save**; they go into app-private `SharedPreferences`. They are
+deliberately *not* injected at build time — this project is built by CI, and no secret
+belongs in the repository or in a public build log. The token field is masked.
+
+Two invariants, both enforced in `HeartRateUploader`:
+
+- **An upload can never disturb BLE reading.** `submit()` only stores the newest reading
+  and returns; the network call runs on a background single-thread executor and every
+  exception is swallowed there.
+- **A slow or dead network cannot build a backlog.** If an upload is still in flight when a
+  newer reading arrives, the older one is dropped — only the newest is kept.
+
+**Test upload** sends a fixed value of 80 so the setup can be checked without waiting for a
+reading. The status line shows the last HTTP code plus running ok/fail counts.
+
+> `SharedPreferences` is app-private but not encrypted. That is fine for a PoC on a
+> non-rooted device; use `EncryptedSharedPreferences` if that is not good enough.
+
 ## Troubleshooting
 
 | Symptom | Meaning |
@@ -122,9 +151,10 @@ for this stage.
 
 ```
 app/src/main/java/com/example/hrble/
-  MainActivity.java    UI + runtime permission flow
-  BleHrClient.java     scan / connect / discoverServices / subscribe / parse dispatch
-  HrParser.java        UUID constants, 0x2A37 flag parsing, pretty-printing
+  MainActivity.java        UI + runtime permission flow + upload configuration
+  BleHrClient.java         scan / connect / discoverServices / subscribe / parse dispatch
+  HrParser.java            UUID constants, 0x2A37 flag parsing, pretty-printing
+  HeartRateUploader.java   coalescing fire-and-forget HTTPS POST
 ```
 
 Package is `com.example.hrble`, deliberately different from the broadcast-based PoC

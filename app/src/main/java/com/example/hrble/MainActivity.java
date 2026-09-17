@@ -1,11 +1,14 @@
 package com.example.hrble;
 
 import android.app.Activity;
+import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Bundle;
+import android.text.InputType;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -17,20 +20,26 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Minimal BLE central UI: scan, pick a device, watch the heart rate.
+ * Minimal BLE central UI: scan, pick a device, watch the heart rate, and
+ * optionally forward each reading to a server.
  *
- * The screen shows exactly what the PoC is meant to answer — whether a connection
- * can be established and whether HR notifications actually flow without any Huami
- * authentication.
+ * The upload URL and bearer token are entered here and kept in app-private
+ * SharedPreferences. They are deliberately NOT compiled in: this project is
+ * built by CI, and no secret should ever be in the repository.
  */
-public class MainActivity extends Activity implements BleHrClient.Listener {
+public class MainActivity extends Activity implements BleHrClient.Listener,
+        HeartRateUploader.Listener {
 
     private static final int REQUEST_PERMISSIONS = 1;
+    private static final String PREFS = "hrble";
+    private static final String KEY_URL = "upload_url";
+    private static final String KEY_TOKEN = "upload_token";
 
     private final SimpleDateFormat timeFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
     private BleHrClient client;
+    private HeartRateUploader uploader;
 
     private TextView scanStateView;
     private TextView deviceView;
@@ -38,17 +47,23 @@ public class MainActivity extends Activity implements BleHrClient.Listener {
     private TextView bpmView;
     private TextView updatedView;
     private TextView countView;
+    private EditText urlInput;
+    private EditText tokenInput;
+    private TextView uploadStatusView;
     private ListView candidateList;
     private ArrayAdapter<String> candidateAdapter;
 
     private final List<BleHrClient.Candidate> candidates = new ArrayList<>();
     private int notificationCount;
+    private int uploadOk;
+    private int uploadFail;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
         int pad = (int) (12 * getResources().getDisplayMetrics().density);
+        int smallGap = (int) (4 * getResources().getDisplayMetrics().density);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -95,6 +110,43 @@ public class MainActivity extends Activity implements BleHrClient.Listener {
         buttons.addView(disconnectButton, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+        // ---- upload configuration ----
+
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+
+        urlInput = new EditText(this);
+        urlInput.setHint("https://.../wearable/heart-rate");
+        urlInput.setTextSize(12);
+        urlInput.setText(prefs.getString(KEY_URL, ""));
+
+        tokenInput = new EditText(this);
+        tokenInput.setHint("bearer token");
+        tokenInput.setTextSize(12);
+        tokenInput.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        tokenInput.setText(prefs.getString(KEY_TOKEN, ""));
+
+        Button saveButton = new Button(this);
+        saveButton.setText("Save");
+        saveButton.setOnClickListener(v -> saveUploadConfig());
+
+        Button testButton = new Button(this);
+        testButton.setText("Test upload");
+        testButton.setOnClickListener(v -> {
+            applyUploadConfig();
+            uploader.submitTest();
+        });
+
+        LinearLayout uploadButtons = new LinearLayout(this);
+        uploadButtons.setOrientation(LinearLayout.HORIZONTAL);
+        uploadButtons.addView(saveButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        uploadButtons.addView(testButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        uploadStatusView = new TextView(this);
+        uploadStatusView.setTextSize(12);
+
         root.addView(scanStateView);
         root.addView(candidateList, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -104,13 +156,44 @@ public class MainActivity extends Activity implements BleHrClient.Listener {
         root.addView(bpmView);
         root.addView(updatedView);
         root.addView(countView);
+        root.addView(spacer(smallGap));
+        root.addView(urlInput);
+        root.addView(tokenInput);
+        root.addView(uploadButtons);
+        root.addView(uploadStatusView);
 
         setContentView(root);
+
+        uploader = new HeartRateUploader(this);
+        applyUploadConfig();
 
         client = new BleHrClient(this, this);
         reset("Idle. Tap Scan.");
 
         requestMissingPermissions();
+    }
+
+    private android.view.View spacer(int height) {
+        android.view.View view = new android.view.View(this);
+        view.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, height));
+        return view;
+    }
+
+    private void saveUploadConfig() {
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_URL, urlInput.getText().toString().trim())
+                .putString(KEY_TOKEN, tokenInput.getText().toString().trim())
+                .apply();
+        applyUploadConfig();
+        uploadStatusView.setText(uploader.isConfigured()
+                ? "upload: configured — tap Test upload"
+                : "upload: disabled (enter both URL and token, then Save)");
+    }
+
+    private void applyUploadConfig() {
+        uploader.configure(urlInput.getText().toString(), tokenInput.getText().toString());
     }
 
     private void reset(String scanState) {
@@ -120,13 +203,19 @@ public class MainActivity extends Activity implements BleHrClient.Listener {
         updatedView.setText("updated: --");
         countView.setText("notifications received: 0");
         scanStateView.setText(scanState);
+        uploadStatusView.setText(uploader.isConfigured()
+                ? "upload: configured"
+                : "upload: disabled (enter both URL and token, then Save)");
         notificationCount = 0;
+        uploadOk = 0;
+        uploadFail = 0;
     }
 
     private void requestMissingPermissions() {
         List<String> missing = new ArrayList<>();
         for (String permission : BleHrClient.requiredPermissions()) {
-            if (checkSelfPermission(permission) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            if (checkSelfPermission(permission)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                 missing.add(permission);
             }
         }
@@ -193,6 +282,24 @@ public class MainActivity extends Activity implements BleHrClient.Listener {
             updatedView.setText("updated: " + timeFormat.format(new Date(timestamp)));
             countView.setText("notifications received: " + notificationCount);
         });
+
+        // Fire-and-forget; returns immediately and never touches the BLE path.
+        uploader.submit(bpm, timestamp);
+    }
+
+    // ------------------------------------------------------- HeartRateUploader.Listener
+
+    @Override
+    public void onUploadResult(boolean ok, String detail) {
+        runOnUiThread(() -> {
+            if (ok) {
+                uploadOk++;
+            } else {
+                uploadFail++;
+            }
+            uploadStatusView.setText("upload: " + (ok ? "OK" : "FAILED") + " " + detail
+                    + "   [ok=" + uploadOk + " fail=" + uploadFail + "]");
+        });
     }
 
     // ------------------------------------------------------------------ lifecycle
@@ -201,6 +308,9 @@ public class MainActivity extends Activity implements BleHrClient.Listener {
     protected void onDestroy() {
         if (client != null) {
             client.shutdown();
+        }
+        if (uploader != null) {
+            uploader.shutdown();
         }
         super.onDestroy();
     }
