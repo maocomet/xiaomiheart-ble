@@ -121,8 +121,14 @@ public class HeartRateUploader {
     private void doUpload(Pending reading) {
         HttpURLConnection connection = null;
         try {
+            // Taken here, not in submit(), so it includes any time the reading spent
+            // queued behind an earlier upload. Both this and measured_at come from the
+            // phone's clock, so their difference is free of cross-device clock skew.
+            long sentAt = System.currentTimeMillis();
+
             String body = "{\"heart_rate\":" + reading.bpm
                     + ",\"measured_at\":\"" + Instant.ofEpochMilli(reading.timestamp) + "\""
+                    + ",\"sent_at\":\"" + Instant.ofEpochMilli(sentAt) + "\""
                     + ",\"source\":\"" + SOURCE + "\"}";
 
             connection = (HttpURLConnection) new URL(url).openConnection();

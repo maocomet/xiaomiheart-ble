@@ -109,10 +109,28 @@ The notification counter is the quickest way to tell "subscribed but silent" apa
 Each reading can be forwarded by HTTPS POST:
 
 ```json
-{"heart_rate": 86, "measured_at": "2026-09-17T07:08:41.789Z", "source": "mi_band_6"}
+{
+  "heart_rate": 86,
+  "measured_at": "2026-09-17T07:08:41.789Z",
+  "sent_at":    "2026-09-17T07:08:41.802Z",
+  "source": "mi_band_6"
+}
 ```
 
 No MAC, no auth key, nothing else device-identifying is sent.
+
+`sent_at` is taken at the moment the request is actually issued, so it includes any time
+the reading spent queued behind an earlier upload. It exists to separate two effects that
+`measured_at` and the server's `received_at` alone cannot tell apart:
+
+| Difference | Contains |
+|---|---|
+| `sent_at - measured_at` | client-side delay only — both ends are the phone's clock, so any cross-device skew cancels out |
+| `received_at - sent_at` | network transit **plus** cross-device clock skew |
+
+A large first difference means the app is queueing (slow link, coalescing); a large second
+difference with a near-zero first one points at clock skew instead. The server treats
+`sent_at` as optional, so builds predating it keep working.
 
 **Configuration is runtime, not compile-time.** Enter the upload URL and bearer token on
 the app screen and tap **Save**; they go into app-private `SharedPreferences`. They are
