@@ -56,7 +56,7 @@ Gadgetbridge → 你的手环 → 设备设置 → **3rd party realtime HR acces
 - "Broadcast GATT notification Intents through BLE Intent API"
 - "BLE API package"
 
-本方案不需要它，且有记录显示开启后 Mi Band 6 会重连异常。
+本方案不需要它。**在本项目当前这套环境（这台 Mi Band 6 + 当前版本的 Gadgetbridge）中，开启后出现过手环重连异常**——本环境的实测观察，不代表所有设备都会如此。
 
 ---
 

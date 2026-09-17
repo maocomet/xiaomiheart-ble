@@ -227,11 +227,14 @@ systemd 以 root 读取 `EnvironmentFile` 后再降权到 `User=funf-mcp`，所�
 
 已完成的验证：
 
+- **实际 MCP 客户端调用已成功验证** —— 经由 `https://funf.maomao.im/mcp` 真实调用 `get_current_heart_rate`，返回手环的真实心率
 - `tools/list` 能看到 `get_current_heart_rate`（连同既有的 6 个工具，共 7 个）
 - 四条路径（`ok` / `stale` / `no_data` / `unavailable`）全部通过
 - `ok` 路径取到的是手环的真实心率
 - 跑完全部异常路径后服务仍然健康、工具注册表未变
 - 既有工具与对外路由无回归
+
+> 前两条分别覆盖了「协议层真的能调通」和「工具确实注册上了」；后四条是在本地直接调用模块完成的，覆盖四条状态路径的具体行为。
 
 验证脚本：`funf-mcp-work/test_heart_rate_tool.py`（独立文件，未并入测试框架——原项目本来就没有测试目录）。
 
