@@ -53,13 +53,17 @@ jobs:
       # it is embedded in every APK -- so pinning it here leaks nothing.
       - name: Verify signing certificate
         run: |
+          # keytool prints this colon-separated and uppercase, apksigner prints it
+          # bare and lowercase, so both sides are normalised before comparing.
           EXPECTED="0B:5D:08:30:1A:2D:87:6F:56:C8:C2:87:DD:95:78:A6:88:81:E1:62:8A:9F:C6:E3:3D:74:0A:4C:95:54:D1:2D"
+          EXPECTED_NORM=$(echo "$EXPECTED" | tr -d ':' | tr '[:upper:]' '[:lower:]')
           APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
           "$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | tee "$RUNNER_TEMP/certs.txt"
-          ACTUAL=$(grep -m1 "certificate SHA-256 digest" "$RUNNER_TEMP/certs.txt" | awk '{print $NF}')
-          echo "expected certificate: $EXPECTED"
+          ACTUAL=$(grep -m1 "certificate SHA-256 digest" "$RUNNER_TEMP/certs.txt" \
+            | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          echo "expected certificate: $EXPECTED_NORM"
           echo "actual certificate  : $ACTUAL"
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
+          if [ "$ACTUAL" != "$EXPECTED_NORM" ]; then
             echo "::error::APK signing certificate changed - upgrade installs would be rejected"
             exit 1
           fi
