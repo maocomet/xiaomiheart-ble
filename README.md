@@ -151,44 +151,66 @@ what Gadgetbridge does for the Mi Band 6:
 write — it is an ordinary GATT write to a characteristic inside `0x180D`, the same service
 this app already subscribes to.
 
-### What is proven and what is not
+### What the source could not settle
 
 Proven from source: the command format is plaintext and lives on the standard service.
 
 **Not** provable from source: whether the band's *firmware* accepts that write on a link
 that never completed the Huami authentication handshake. Gadgetbridge only ever sends it
 after `performInitialized()`, so its source cannot settle the question. That is what this
-experiment measures.
+experiment measured.
 
-If it works, no `auth_key` is needed anywhere in this app. If it fails, the write callback
-status says how:
+### Result: it works, and no `auth_key` is needed
+
+Measured on the Mi Band 6 (vivo V2162A, Android 14):
+
+- `0x2A39 present: READ WRITE` — the control point exists inside `0x180D` and is writable.
+- The write is **accepted on a plain, unauthenticated link**: `write callback start
+  status=0`, and the band starts measuring. **No `auth_key` appears anywhere in this app.**
+- One `15 01 01` produces the first usable BPM in **~1.1 s**.
+- Baseline with no command is **0 notifications**; after the command, readings flow.
+- `15 01 00` stops it: **0 notifications in the following 40 s**.
+
+A rejection would have said so directly, so this route never needs guessing:
 
 | `onCharacteristicWrite` status | Reading |
 |---|---|
-| `0` (`GATT_SUCCESS`) | Write accepted — then the notification rate decides whether it acted |
-| `3` / `5` / `133` | Firmware rejected it; this route needs the Huami session |
+| `0` (`GATT_SUCCESS`) | Accepted — then the notification rate decides whether it acted |
+| `3` / `5` / `133` | Firmware rejected it; this route would need the Huami session |
+
+### One start does not last — but re-sending buys time, not rate
+
+The band measures for about **27 s** after a single start command and then stops on its own
+(last reading 27.4 s after the write, then 69 s of silence). That is precisely why
+Gadgetbridge re-sends the command every second. Re-sending does **not** make it measure
+faster:
+
+| Mode | Start writes | Notifications |
+|---|---|---|
+| Single start | 1 | ~0.35/s for ~27 s, then silent |
+| **Repeat start every 1s** | 30 in 30 s | ~0.30/s, **still running** |
+
+The raw rate is **~0.35–0.40/s** — one reading every 2.5–3 s, and irregular (gaps ranged
+from 1.3 s to 5.3 s). That is noticeably slower than the ~1/s a first reading of
+Gadgetbridge's Live Activity screen suggests.
+
+For the "measure on demand for 30–60 s" design this is convenient: **the band's own ~27 s
+timeout already lands inside the desired window**, so a single start may need no timer of
+our own.
 
 ### Running it
 
-1. Connect to the band and check the status line reports
-   `0x2A39 present: WRITE` (or `WRITE_NO_RESPONSE`). If it says `NOT present`, this route is
-   closed and the experiment ends there.
-2. Tap **Start realtime HR** and watch `rate:` — it shows arrivals per second over a
-   trailing 30 s window. The band measuring on its own schedule looks sporadic; a command
-   that took effect looks like roughly `1.00/s`.
-3. The status line reports the write status, then
-   `first BPM <N>ms after start` — how long the band takes to converge after being told to
-   measure.
-4. Tap **Stop realtime HR** and confirm the rate falls away.
+1. Connect to the band and check the status line reports `0x2A39 present: READ WRITE`. If it
+   says `NOT present`, this route is closed and the experiment ends there.
+2. Tap **Start realtime HR** and watch `rate:` — arrivals per second over a trailing 30 s
+   window. It climbs to roughly `0.35/s`, then falls back to zero about 30 s later.
+3. The status line reports the write status, then `first BPM <N>ms after start`.
+4. Tap **Stop realtime HR** and confirm the rate falls away immediately.
 
-**Repeat start every 1s** reproduces Gadgetbridge's own behaviour: its Live Activity screen
-re-sends the start command once a second, with the comment *"have to enable it again and
-again to keep it measuring"* (`LiveActivityFragment.java:351`). Whether one write is enough
-here is exactly what the toggle is for — it is off by default so a single write can be
-judged on its own first.
+**Repeat start every 1s** holds the measurement open indefinitely, at the cost of a write
+every second. It is off by default so a single write can be judged on its own first.
 
-This is a diagnostic screen, not the product: there is no auto-stop timer and nothing calls
-it from the server yet.
+This is a diagnostic screen, not the product: nothing triggers it from the server yet.
 
 ## Uploading readings to a server
 
@@ -272,7 +294,9 @@ URL (`.../wearable/heart-rate` → `.../wearable/time`) rather than configured s
 | Connected, `0x180D` not in the service map | "3rd party realtime HR access" was not applied — reconnect the band in Gadgetbridge so the command is pushed |
 | Connected, `0x180D` found, CCCD write OK, **0 notifications** | The band is not measuring — use **Start realtime HR**, or start an activity / enable whole-day HR on the band |
 | `0x2A39 NOT present in 0x180D` | The firmware does not expose the control point; continuous measurement cannot be started from here |
-| Start write returns `0` but the rate stays sporadic | Write reached the GATT server but the firmware ignored it — see **Repeat start every 1s** |
+| Start write returns `0` but **no** readings follow | The write reached the GATT server but the firmware did not act on it — try **Repeat start every 1s** |
+| Readings stop ~27 s after a single start | Expected: the band's own measurement timeout. Use **Repeat start every 1s**, or just start again |
+| Rate is ~0.35/s rather than ~1/s | Expected on this band — see the measured table above |
 | Notifications stop after a while | The band went idle, or Gadgetbridge reconnected and took the link |
 
 In every failure case the app dumps the full service/characteristic map to logcat. It does
