@@ -24,6 +24,7 @@ import android.os.Looper;
 import android.os.ParcelUuid;
 import android.util.Log;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -58,6 +59,12 @@ public class BleHrClient {
         void onConnectionState(String state);
 
         void onHeartRate(int bpm, long timestamp);
+
+        /**
+         * Realtime-HR control messages, kept separate from onConnectionState so a
+         * control-point result never overwrites the connection status line.
+         */
+        void onRealtimeHr(String state);
     }
 
     /** A scan result, ranked so the likeliest band sorts to the top. */
@@ -97,6 +104,40 @@ public class BleHrClient {
     private BluetoothLeScanner scanner;
     private BluetoothGatt gatt;
     private boolean scanning;
+
+    // ------------------------------------------------------------ realtime HR control
+
+    /**
+     * 0x2A39 Heart Rate Control Point, taken from the discovered 0x180D service.
+     * Null until discoverServices() succeeds, or when the band does not expose it.
+     */
+    private BluetoothGattCharacteristic hrControlPoint;
+
+    /**
+     * Huami HR control-point payloads, mirrored from Gadgetbridge:
+     *   service/devices/huami/HuamiSupport.java:590-593
+     *   devices/miband/MiBandService.java:186-187  (COMMAND_SET__HR_CONTINUOUS = 0x01)
+     *
+     * These are plain GATT writes — Gadgetbridge applies no encryption or session
+     * layer to them. Whether the *firmware* accepts them on a link that never
+     * completed the Huami auth handshake is exactly what this PoC measures.
+     */
+    private static final byte[] HR_START_CONTINUOUS = {0x15, 0x01, 0x01};
+    private static final byte[] HR_STOP_CONTINUOUS = {0x15, 0x01, 0x00};
+
+    /** Names the write currently in flight so its callback can report which one it was. */
+    private volatile String pendingHrWrite;
+    private volatile boolean pendingHrWriteIsStart;
+
+    /**
+     * Set when a start command is queued, consumed by the first usable BPM.
+     * Measures how long the band takes to converge after being told to measure.
+     */
+    private volatile long realtimeStartSentAt;
+
+    /** Arrival times of recent notifications, for reporting the rate actually delivered. */
+    private final ArrayDeque<Long> recentNotifyAt = new ArrayDeque<>();
+    private static final long RATE_WINDOW_MS = 30_000L;
 
     public BleHrClient(Context context, Listener listener) {
         this.context = context.getApplicationContext();
@@ -322,6 +363,12 @@ public class BleHrClient {
             }
             gatt = null;
         }
+        // The characteristic belongs to the GATT handle that just went away; keeping
+        // the reference would let a later write be queued against a dead connection.
+        hrControlPoint = null;
+        pendingHrWrite = null;
+        pendingHrWriteIsStart = false;
+        realtimeStartSentAt = 0L;
     }
 
     /** Release everything; call from the Activity's onDestroy. */
@@ -384,6 +431,7 @@ public class BleHrClient {
                 return;
             }
 
+            reportHrControlPoint(hrService);
             subscribe(g, hrCharacteristic);
         }
 
@@ -400,6 +448,36 @@ public class BleHrClient {
             } else {
                 listener.onConnectionState("CCCD write failed: status=" + status
                         + " (" + gattStatusName(status) + ")");
+            }
+        }
+
+        /**
+         * The verdict on a realtime-HR command. A GATT_SUCCESS here means the band's
+         * GATT server accepted the write; it does not yet mean the firmware acted on
+         * it — the notification rate is what settles that.
+         */
+        @Override
+        public void onCharacteristicWrite(BluetoothGatt g,
+                                          BluetoothGattCharacteristic characteristic,
+                                          int status) {
+            if (!HrParser.UUID_HR_CONTROL_POINT.equalsIgnoreCase(
+                    characteristic.getUuid().toString())) {
+                return;
+            }
+
+            String label = pendingHrWrite == null ? "?" : pendingHrWrite;
+            boolean isStart = pendingHrWriteIsStart;
+            pendingHrWrite = null;
+            pendingHrWriteIsStart = false;
+
+            Log.i(TAG, "0x2A39 write callback " + label + " status=" + status
+                    + " (" + gattStatusName(status) + ")");
+            listener.onRealtimeHr(label + " write -> status=" + status
+                    + " (" + gattStatusName(status) + ")");
+
+            if (isStart) {
+                realtimeStartSentAt = (status == BluetoothGatt.GATT_SUCCESS)
+                        ? System.currentTimeMillis() : 0L;
             }
         }
 
@@ -473,6 +551,97 @@ public class BleHrClient {
         }
     }
 
+    // ---------------------------------------------------------------- realtime HR control
+
+    /**
+     * Records whether 0x2A39 exists and is writable, and says so out loud. The full
+     * service map is dumped separately; this one line is the answer to "is the
+     * realtime-HR route even available on this firmware".
+     */
+    private void reportHrControlPoint(BluetoothGattService hrService) {
+        hrControlPoint = hrService.getCharacteristic(
+                UUID.fromString(HrParser.UUID_HR_CONTROL_POINT));
+
+        if (hrControlPoint == null) {
+            Log.w(TAG, "0x2A39 NOT present in 0x180D — realtime HR control unavailable");
+            listener.onRealtimeHr("0x2A39 NOT present in 0x180D — no realtime HR control");
+            return;
+        }
+
+        int properties = hrControlPoint.getProperties();
+        boolean writable = (properties & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+                || (properties & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
+
+        String detail = "0x2A39 present: " + HrParser.describeProperties(properties)
+                + (writable ? "" : "  — NOT WRITABLE");
+        Log.i(TAG, detail);
+        listener.onRealtimeHr(detail);
+    }
+
+    /** Huami "start continuous heart-rate measurement": 15 01 01 to 0x2A39. */
+    public void startRealtimeHr() {
+        writeHrControlPoint(HR_START_CONTINUOUS, "start", true);
+    }
+
+    /** Huami "stop continuous heart-rate measurement": 15 01 00 to 0x2A39. */
+    public void stopRealtimeHr() {
+        writeHrControlPoint(HR_STOP_CONTINUOUS, "stop", false);
+    }
+
+    private void writeHrControlPoint(byte[] payload, String label, boolean isStart) {
+        if (gatt == null) {
+            listener.onRealtimeHr(label + ": no GATT connection");
+            return;
+        }
+        if (hrControlPoint == null) {
+            listener.onRealtimeHr(label + ": 0x2A39 unavailable — connect to the band first");
+            return;
+        }
+
+        int properties = hrControlPoint.getProperties();
+        boolean withResponse = (properties & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+        boolean withoutResponse =
+                (properties & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
+
+        if (!withResponse && !withoutResponse) {
+            listener.onRealtimeHr(label + ": 0x2A39 advertises no write property");
+            return;
+        }
+
+        // Prefer write-with-response: its callback status is the evidence we are after.
+        // Gadgetbridge never calls setWriteType, so DEFAULT is also what it gets.
+        int writeType = withResponse
+                ? BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                : BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
+        String typeName = withResponse ? "DEFAULT" : "NO_RESPONSE";
+        String hex = HrParser.toHex(payload);
+
+        pendingHrWrite = label;
+        pendingHrWriteIsStart = isStart;
+        if (isStart) {
+            // Cleared until the write is confirmed, so a rejected write cannot be
+            // mistaken for a slow one when the latency is finally reported.
+            realtimeStartSentAt = 0L;
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // API 33+ passes the value explicitly and returns a BluetoothStatusCodes int
+            // rather than the deprecated boolean-returning single-argument form.
+            int status = gatt.writeCharacteristic(hrControlPoint, payload, writeType);
+            Log.i(TAG, "0x2A39 write " + label + " payload=" + hex
+                    + " type=" + typeName + " -> status=" + status);
+            listener.onRealtimeHr(label + " " + hex + " queued, status=" + status
+                    + (status == BluetoothStatusCodes.SUCCESS ? "" : "  (REJECTED)"));
+        } else {
+            hrControlPoint.setWriteType(writeType);
+            hrControlPoint.setValue(payload);
+            boolean queued = gatt.writeCharacteristic(hrControlPoint);
+            Log.i(TAG, "0x2A39 write " + label + " payload=" + hex
+                    + " type=" + typeName + " -> " + queued);
+            listener.onRealtimeHr(label + " " + hex + " queued=" + queued);
+        }
+    }
+
     private void handleNotification(BluetoothGattCharacteristic characteristic, byte[] value) {
         if (!HrParser.UUID_HR_MEASUREMENT.equalsIgnoreCase(
                 characteristic.getUuid().toString())) {
@@ -490,8 +659,46 @@ public class BleHrClient {
             return;
         }
 
+        logNotifyRate(timestamp);
+        reportStartLatency(timestamp);
+
         Log.i(TAG, "HR=" + bpm + " timestamp=" + timestamp);
         listener.onHeartRate(bpm, timestamp);
+    }
+
+    /**
+     * Rolling estimate of how often 0x2A37 actually fires. Moving this from
+     * "occasional" to about once per second is the whole point of the start command,
+     * so it is the number that decides whether the write did anything.
+     *
+     * Log only — the UI derives its own rate from the readings it already receives.
+     */
+    private void logNotifyRate(long now) {
+        recentNotifyAt.addLast(now);
+        while (!recentNotifyAt.isEmpty() && now - recentNotifyAt.peekFirst() > RATE_WINDOW_MS) {
+            recentNotifyAt.removeFirst();
+        }
+
+        int count = recentNotifyAt.size();
+        long span = count < 2 ? 0 : now - recentNotifyAt.peekFirst();
+        if (span <= 0) {
+            return;
+        }
+        Log.i(TAG, "notify rate: " + count + " in " + span + "ms = "
+                + String.format(Locale.US, "%.2f", count * 1000.0 / span) + "/s");
+    }
+
+    /** Time from the accepted start command to the first usable BPM; reported once. */
+    private void reportStartLatency(long now) {
+        long sentAt = realtimeStartSentAt;
+        if (sentAt == 0L) {
+            return;
+        }
+        realtimeStartSentAt = 0L;
+
+        long delta = now - sentAt;
+        Log.i(TAG, "start -> first BPM latency: " + delta + "ms");
+        listener.onRealtimeHr("first BPM " + delta + "ms after start");
     }
 
     private void dumpServices(BluetoothGatt g, int status) {

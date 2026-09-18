@@ -14,6 +14,7 @@ import android.widget.ListView;
 import android.widget.TextView;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -51,6 +52,9 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
     private EditText tokenInput;
     private TextView uploadStatusView;
     private TextView calibrationView;
+    private TextView realtimeView;
+    private TextView rateView;
+    private Button repeatStartButton;
     private ListView candidateList;
     private ArrayAdapter<String> candidateAdapter;
 
@@ -58,6 +62,36 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
     private int notificationCount;
     private int uploadOk;
     private int uploadFail;
+
+    // ------------------------------------------------------------ realtime HR experiment
+
+    /**
+     * Gadgetbridge re-sends the start command once a second while its Live Activity
+     * screen is open ("have to enable it again and again to keep it measuring" —
+     * activities/charts/LiveActivityFragment.java:351). Whether one write is enough
+     * on this firmware is one of the things this PoC has to answer, so the repeat is
+     * a toggle rather than baked in.
+     */
+    private boolean repeatingStart;
+    private static final long REPEAT_INTERVAL_MS = 1_000L;
+
+    private final android.os.Handler repeatHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
+    private final Runnable repeatStart = new Runnable() {
+        @Override
+        public void run() {
+            if (!repeatingStart) {
+                return;
+            }
+            client.startRealtimeHr();
+            repeatHandler.postDelayed(this, REPEAT_INTERVAL_MS);
+        }
+    };
+
+    /** Arrival times used to show the notification rate the band is actually delivering. */
+    private final ArrayDeque<Long> recentReadings = new ArrayDeque<>();
+    private static final long RATE_WINDOW_MS = 30_000L;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -96,13 +130,54 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         countView = new TextView(this);
         countView.setTextSize(13);
 
+        realtimeView = new TextView(this);
+        realtimeView.setTextSize(12);
+
+        rateView = new TextView(this);
+        rateView.setTextSize(13);
+
+        Button hrStartButton = new Button(this);
+        hrStartButton.setText("Start realtime HR");
+        hrStartButton.setOnClickListener(v -> client.startRealtimeHr());
+
+        Button hrStopButton = new Button(this);
+        hrStopButton.setText("Stop realtime HR");
+        hrStopButton.setOnClickListener(v -> {
+            stopRepeatingStart();
+            client.stopRealtimeHr();
+        });
+
+        repeatStartButton = new Button(this);
+        repeatStartButton.setText("Repeat start every 1s: OFF");
+        repeatStartButton.setOnClickListener(v -> {
+            if (repeatingStart) {
+                stopRepeatingStart();
+                realtimeView.setText("repeat start: OFF");
+            } else {
+                repeatingStart = true;
+                repeatStartButton.setText("Repeat start every 1s: ON");
+                realtimeView.setText("repeat start: ON — re-sending 15 01 01 every second");
+                repeatHandler.post(repeatStart);
+            }
+        });
+
+        LinearLayout realtimeButtons = new LinearLayout(this);
+        realtimeButtons.setOrientation(LinearLayout.HORIZONTAL);
+        realtimeButtons.addView(hrStartButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        realtimeButtons.addView(hrStopButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
         Button scanButton = new Button(this);
         scanButton.setText("Scan");
         scanButton.setOnClickListener(v -> client.startScan());
 
         Button disconnectButton = new Button(this);
         disconnectButton.setText("Disconnect");
-        disconnectButton.setOnClickListener(v -> client.disconnect());
+        disconnectButton.setOnClickListener(v -> {
+            stopRepeatingStart();
+            client.disconnect();
+        });
 
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
@@ -171,6 +246,11 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         root.addView(updatedView);
         root.addView(countView);
         root.addView(spacer(smallGap));
+        root.addView(realtimeButtons);
+        root.addView(repeatStartButton);
+        root.addView(realtimeView);
+        root.addView(rateView);
+        root.addView(spacer(smallGap));
         root.addView(urlInput);
         root.addView(tokenInput);
         root.addView(uploadButtons);
@@ -221,9 +301,21 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         uploadStatusView.setText(uploader.isConfigured()
                 ? "upload: configured"
                 : "upload: disabled (enter both URL and token, then Save)");
+        realtimeView.setText("realtime HR: connect to the band to see 0x2A39 status");
+        rateView.setText("rate: --");
         notificationCount = 0;
         uploadOk = 0;
         uploadFail = 0;
+        recentReadings.clear();
+    }
+
+    private void stopRepeatingStart() {
+        if (!repeatingStart) {
+            return;
+        }
+        repeatingStart = false;
+        repeatHandler.removeCallbacks(repeatStart);
+        repeatStartButton.setText("Repeat start every 1s: OFF");
     }
 
     private void requestMissingPermissions() {
@@ -296,10 +388,37 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
             bpmView.setText(String.valueOf(bpm));
             updatedView.setText("updated: " + timeFormat.format(new Date(timestamp)));
             countView.setText("notifications received: " + notificationCount);
+            rateView.setText("rate: " + describeRate(timestamp));
         });
 
         // Fire-and-forget; returns immediately and never touches the BLE path.
         uploader.submit(bpm, timestamp);
+    }
+
+    /**
+     * How often 0x2A37 is actually arriving, over a trailing window. This is the
+     * number the whole experiment turns on: occasional means the band is measuring
+     * on its own schedule, roughly 1/s means the start command took effect.
+     */
+    private String describeRate(long now) {
+        recentReadings.addLast(now);
+        while (!recentReadings.isEmpty()
+                && now - recentReadings.peekFirst() > RATE_WINDOW_MS) {
+            recentReadings.removeFirst();
+        }
+
+        int count = recentReadings.size();
+        long span = count < 2 ? 0 : now - recentReadings.peekFirst();
+        if (span <= 0) {
+            return "just started (" + count + " reading)";
+        }
+        return String.format(Locale.US, "%.2f/s  (%d readings in %ds)",
+                count * 1000.0 / span, count, span / 1000);
+    }
+
+    @Override
+    public void onRealtimeHr(String state) {
+        runOnUiThread(() -> realtimeView.setText("realtime HR: " + state));
     }
 
     // ------------------------------------------------------- HeartRateUploader.Listener
@@ -333,6 +452,8 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
 
     @Override
     protected void onDestroy() {
+        stopRepeatingStart();
+        repeatHandler.removeCallbacksAndMessages(null);
         if (client != null) {
             client.shutdown();
         }

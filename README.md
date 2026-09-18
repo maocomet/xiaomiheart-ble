@@ -132,6 +132,64 @@ update time · number of notifications received.
 The notification counter is the quickest way to tell "subscribed but silent" apart from
 "never subscribed".
 
+## Starting continuous heart-rate measurement from the app
+
+The band does not measure continuously on its own — notifications only trickle in during a
+manual measurement, a workout, or periodic monitoring. **Start realtime HR** asks the band
+to start measuring continuously.
+
+It writes three plain bytes to the **standard** Heart Rate Control Point `0x2A39`, mirroring
+what Gadgetbridge does for the Mi Band 6:
+
+| Action | Payload | Source |
+|---|---|---|
+| Start continuous | `15 01 01` | `HuamiSupport.java:592` |
+| Stop continuous | `15 01 00` | `HuamiSupport.java:593` |
+
+`0x15` is the Mi Band command prefix; `0x01` is `COMMAND_SET__HR_CONTINUOUS`
+(`MiBandService.java:186`). Gadgetbridge applies **no encryption or session layer** to this
+write — it is an ordinary GATT write to a characteristic inside `0x180D`, the same service
+this app already subscribes to.
+
+### What is proven and what is not
+
+Proven from source: the command format is plaintext and lives on the standard service.
+
+**Not** provable from source: whether the band's *firmware* accepts that write on a link
+that never completed the Huami authentication handshake. Gadgetbridge only ever sends it
+after `performInitialized()`, so its source cannot settle the question. That is what this
+experiment measures.
+
+If it works, no `auth_key` is needed anywhere in this app. If it fails, the write callback
+status says how:
+
+| `onCharacteristicWrite` status | Reading |
+|---|---|
+| `0` (`GATT_SUCCESS`) | Write accepted — then the notification rate decides whether it acted |
+| `3` / `5` / `133` | Firmware rejected it; this route needs the Huami session |
+
+### Running it
+
+1. Connect to the band and check the status line reports
+   `0x2A39 present: WRITE` (or `WRITE_NO_RESPONSE`). If it says `NOT present`, this route is
+   closed and the experiment ends there.
+2. Tap **Start realtime HR** and watch `rate:` — it shows arrivals per second over a
+   trailing 30 s window. The band measuring on its own schedule looks sporadic; a command
+   that took effect looks like roughly `1.00/s`.
+3. The status line reports the write status, then
+   `first BPM <N>ms after start` — how long the band takes to converge after being told to
+   measure.
+4. Tap **Stop realtime HR** and confirm the rate falls away.
+
+**Repeat start every 1s** reproduces Gadgetbridge's own behaviour: its Live Activity screen
+re-sends the start command once a second, with the comment *"have to enable it again and
+again to keep it measuring"* (`LiveActivityFragment.java:351`). Whether one write is enough
+here is exactly what the toggle is for — it is off by default so a single write can be
+judged on its own first.
+
+This is a diagnostic screen, not the product: there is no auto-stop timer and nothing calls
+it from the server yet.
+
 ## Uploading readings to a server
 
 Each reading can be forwarded by HTTPS POST:
@@ -212,7 +270,9 @@ URL (`.../wearable/heart-rate` → `.../wearable/time`) rather than configured s
 | No candidates at all | BLE off, permissions denied, or `neverForLocation` filtering — see the fallback above |
 | `status=133` on connect | The notorious generic Android GATT error; usually a stale link. Tap Scan and retry |
 | Connected, `0x180D` not in the service map | "3rd party realtime HR access" was not applied — reconnect the band in Gadgetbridge so the command is pushed |
-| Connected, `0x180D` found, CCCD write OK, **0 notifications** | The band is not measuring (start an activity / enable whole-day HR), **or** this service does require Huami authentication after all |
+| Connected, `0x180D` found, CCCD write OK, **0 notifications** | The band is not measuring — use **Start realtime HR**, or start an activity / enable whole-day HR on the band |
+| `0x2A39 NOT present in 0x180D` | The firmware does not expose the control point; continuous measurement cannot be started from here |
+| Start write returns `0` but the rate stays sporadic | Write reached the GATT server but the firmware ignored it — see **Repeat start every 1s** |
 | Notifications stop after a while | The band went idle, or Gadgetbridge reconnected and took the link |
 
 In every failure case the app dumps the full service/characteristic map to logcat. It does
@@ -223,8 +283,8 @@ for this stage.
 
 ```
 app/src/main/java/com/example/hrble/
-  MainActivity.java        UI + runtime permission flow + upload configuration
-  BleHrClient.java         scan / connect / discoverServices / subscribe / parse dispatch
+  MainActivity.java        UI + runtime permission flow + upload configuration + realtime HR controls
+  BleHrClient.java         scan / connect / discoverServices / subscribe / parse dispatch / 0x2A39 writes
   HrParser.java            UUID constants, 0x2A37 flag parsing, pretty-printing
   HeartRateUploader.java   coalescing fire-and-forget HTTPS POST
 ```
