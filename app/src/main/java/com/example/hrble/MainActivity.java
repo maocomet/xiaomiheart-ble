@@ -1,9 +1,13 @@
 package com.example.hrble;
 
 import android.app.Activity;
-import android.content.SharedPreferences;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.text.InputType;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
@@ -21,77 +25,78 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Minimal BLE central UI: scan, pick a device, watch the heart rate, and
- * optionally forward each reading to a server.
+ * Controls and status display for {@link HrMonitorService}. It deliberately owns no
+ * BLE and no networking: the service does all of that, and keeps doing it after this
+ * Activity is gone.
  *
- * The upload URL and bearer token are entered here and kept in app-private
- * SharedPreferences. They are deliberately NOT compiled in: this project is
- * built by CI, and no secret should ever be in the repository.
+ * What is left here is exactly what needs a screen: picking the band once, starting and
+ * stopping monitoring, and rendering whatever the service reports. The Activity binds
+ * for as long as it is visible and clears its listener on the way out, so it never
+ * keeps the service alive and the service never holds a dead Activity.
  */
-public class MainActivity extends Activity implements BleHrClient.Listener,
-        HeartRateUploader.Listener {
+public class MainActivity extends Activity implements HrMonitorService.UiListener {
 
     private static final int REQUEST_PERMISSIONS = 1;
-    private static final String PREFS = "hrble";
-    private static final String KEY_URL = "upload_url";
-    private static final String KEY_TOKEN = "upload_token";
+
+    private HrMonitorService service;
+    private boolean bound;
 
     private final SimpleDateFormat timeFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
-    private BleHrClient client;
-    private HeartRateUploader uploader;
-
+    private TextView serviceView;
     private TextView scanStateView;
     private TextView deviceView;
     private TextView connectionView;
     private TextView bpmView;
     private TextView updatedView;
     private TextView countView;
-    private EditText urlInput;
-    private EditText tokenInput;
+    private TextView rateView;
+    private TextView realtimeView;
     private TextView uploadStatusView;
     private TextView calibrationView;
-    private TextView realtimeView;
-    private TextView rateView;
-    private Button repeatStartButton;
+    private EditText urlInput;
+    private EditText tokenInput;
+    private Button startButton;
+    private Button stopButton;
+    private Button scanButton;
     private ListView candidateList;
     private ArrayAdapter<String> candidateAdapter;
 
     private final List<BleHrClient.Candidate> candidates = new ArrayList<>();
-    private int notificationCount;
-    private int uploadOk;
-    private int uploadFail;
 
-    // ------------------------------------------------------------ realtime HR experiment
+    /** Arrival times used to show the rate the band is actually delivering. */
+    private final ArrayDeque<Long> recentReadings = new ArrayDeque<>();
+    private static final long RATE_WINDOW_MS = 30_000L;
+    private long lastRateSample;
+    private String rateText = "rate: --";
 
-    /**
-     * Gadgetbridge re-sends the start command once a second while its Live Activity
-     * screen is open ("have to enable it again and again to keep it measuring" —
-     * activities/charts/LiveActivityFragment.java:351). Whether one write is enough
-     * on this firmware is one of the things this PoC has to answer, so the repeat is
-     * a toggle rather than baked in.
-     */
-    private boolean repeatingStart;
-    private static final long REPEAT_INTERVAL_MS = 1_000L;
-
-    private final android.os.Handler repeatHandler =
-            new android.os.Handler(android.os.Looper.getMainLooper());
-
-    private final Runnable repeatStart = new Runnable() {
+    private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
-        public void run() {
-            if (!repeatingStart) {
-                return;
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            service = ((HrMonitorService.LocalBinder) binder).getService();
+            bound = true;
+
+            urlInput.setText(service.configuredUrl());
+            tokenInput.setText(service.configuredToken());
+
+            // Also pushes the current scan state, candidate list and status, so
+            // re-opening the Activity shows the live picture instead of a blank one.
+            service.setListener(MainActivity.this);
+
+            if (!service.hasSavedDevice()) {
+                service.startScan();
             }
-            client.startRealtimeHr();
-            repeatHandler.postDelayed(this, REPEAT_INTERVAL_MS);
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            service = null;
+            bound = false;
         }
     };
 
-    /** Arrival times used to show the notification rate the band is actually delivering. */
-    private final ArrayDeque<Long> recentReadings = new ArrayDeque<>();
-    private static final long RATE_WINDOW_MS = 30_000L;
+    // ------------------------------------------------------------------ lifecycle
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -104,15 +109,21 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(pad, pad, pad, pad);
 
-        scanStateView = new TextView(this);
-        scanStateView.setTextSize(13);
+        serviceView = new TextView(this);
+        serviceView.setTextSize(13);
 
         candidateAdapter = new ArrayAdapter<>(this,
                 android.R.layout.simple_list_item_1, new ArrayList<>());
         candidateList = new ListView(this);
         candidateList.setAdapter(candidateAdapter);
-        candidateList.setOnItemClickListener((parent, view, position, id) ->
-                client.connect(candidates.get(position)));
+        candidateList.setOnItemClickListener((parent, view, position, id) -> {
+            if (service != null) {
+                service.selectDevice(candidates.get(position));
+            }
+        });
+
+        scanStateView = new TextView(this);
+        scanStateView.setTextSize(13);
 
         deviceView = new TextView(this);
         deviceView.setTextSize(13);
@@ -130,34 +141,58 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         countView = new TextView(this);
         countView.setTextSize(13);
 
-        realtimeView = new TextView(this);
-        realtimeView.setTextSize(12);
-
         rateView = new TextView(this);
         rateView.setTextSize(13);
 
+        realtimeView = new TextView(this);
+        realtimeView.setTextSize(12);
+
+        scanButton = new Button(this);
+        scanButton.setText("Scan");
+        scanButton.setOnClickListener(v -> {
+            if (service != null) {
+                service.startScan();
+            }
+        });
+
+        startButton = new Button(this);
+        startButton.setText("Start monitoring");
+        startButton.setOnClickListener(v -> {
+            if (service != null) {
+                service.startMonitoring();
+            }
+        });
+
+        stopButton = new Button(this);
+        stopButton.setText("Stop monitoring");
+        stopButton.setOnClickListener(v -> {
+            if (service != null) {
+                service.stopMonitoring();
+            }
+        });
+
+        LinearLayout scanRow = new LinearLayout(this);
+        scanRow.setOrientation(LinearLayout.HORIZONTAL);
+        scanRow.addView(scanButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        scanRow.addView(startButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        scanRow.addView(stopButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
         Button hrStartButton = new Button(this);
         hrStartButton.setText("Start realtime HR");
-        hrStartButton.setOnClickListener(v -> client.startRealtimeHr());
+        hrStartButton.setOnClickListener(v -> {
+            if (service != null) {
+                service.triggerRealtimeHr();
+            }
+        });
 
         Button hrStopButton = new Button(this);
         hrStopButton.setText("Stop realtime HR");
         hrStopButton.setOnClickListener(v -> {
-            stopRepeatingStart();
-            client.stopRealtimeHr();
-        });
-
-        repeatStartButton = new Button(this);
-        repeatStartButton.setText("Repeat start every 1s: OFF");
-        repeatStartButton.setOnClickListener(v -> {
-            if (repeatingStart) {
-                stopRepeatingStart();
-                realtimeView.setText("repeat start: OFF");
-            } else {
-                repeatingStart = true;
-                repeatStartButton.setText("Repeat start every 1s: ON");
-                realtimeView.setText("repeat start: ON — re-sending 15 01 01 every second");
-                repeatHandler.post(repeatStart);
+            if (service != null) {
+                service.stopRealtimeHr();
             }
         });
 
@@ -168,57 +203,41 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         realtimeButtons.addView(hrStopButton, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        Button scanButton = new Button(this);
-        scanButton.setText("Scan");
-        scanButton.setOnClickListener(v -> client.startScan());
-
-        Button disconnectButton = new Button(this);
-        disconnectButton.setText("Disconnect");
-        disconnectButton.setOnClickListener(v -> {
-            stopRepeatingStart();
-            client.disconnect();
-        });
-
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setOrientation(LinearLayout.HORIZONTAL);
-        buttons.addView(scanButton, new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        buttons.addView(disconnectButton, new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
         // ---- upload configuration ----
-
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
 
         urlInput = new EditText(this);
         urlInput.setHint("https://.../wearable/heart-rate");
         urlInput.setTextSize(12);
-        urlInput.setText(prefs.getString(KEY_URL, ""));
 
         tokenInput = new EditText(this);
         tokenInput.setHint("bearer token");
         tokenInput.setTextSize(12);
         tokenInput.setInputType(InputType.TYPE_CLASS_TEXT
                 | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        tokenInput.setText(prefs.getString(KEY_TOKEN, ""));
 
         Button saveButton = new Button(this);
         saveButton.setText("Save");
-        saveButton.setOnClickListener(v -> saveUploadConfig());
+        saveButton.setOnClickListener(v -> {
+            if (service != null) {
+                service.configureUpload(urlInput.getText().toString(),
+                        tokenInput.getText().toString());
+            }
+        });
 
         Button testButton = new Button(this);
         testButton.setText("Test upload");
         testButton.setOnClickListener(v -> {
-            applyUploadConfig();
-            uploader.submitTest();
+            if (service != null) {
+                service.submitTestUpload();
+            }
         });
 
         Button calibrateButton = new Button(this);
         calibrateButton.setText("Calibrate");
         calibrateButton.setOnClickListener(v -> {
-            applyUploadConfig();
-            calibrationView.setText("calibrating...");
-            uploader.calibrate();
+            if (service != null) {
+                service.calibrate();
+            }
         });
 
         LinearLayout uploadButtons = new LinearLayout(this);
@@ -236,20 +255,20 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         calibrationView = new TextView(this);
         calibrationView.setTextSize(12);
 
+        root.addView(serviceView);
+        root.addView(scanRow);
         root.addView(scanStateView);
         root.addView(candidateList, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        root.addView(buttons);
         root.addView(deviceView);
         root.addView(connectionView);
         root.addView(bpmView);
         root.addView(updatedView);
         root.addView(countView);
+        root.addView(rateView);
         root.addView(spacer(smallGap));
         root.addView(realtimeButtons);
-        root.addView(repeatStartButton);
         root.addView(realtimeView);
-        root.addView(rateView);
         root.addView(spacer(smallGap));
         root.addView(urlInput);
         root.addView(tokenInput);
@@ -259,13 +278,31 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
 
         setContentView(root);
 
-        uploader = new HeartRateUploader(this);
-        applyUploadConfig();
-
-        client = new BleHrClient(this, this);
-        reset("Idle. Tap Scan.");
-
         requestMissingPermissions();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        // Binding creates the service if it is not running; if monitoring is on it is
+        // already running and this just re-attaches.
+        bindService(new Intent(this, HrMonitorService.class),
+                serviceConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    @Override
+    protected void onStop() {
+        if (bound) {
+            // Clear before unbinding. The service outlives this Activity whenever
+            // monitoring is on, and must not hold a reference to a dead one.
+            if (service != null) {
+                service.setListener(null);
+            }
+            unbindService(serviceConnection);
+            bound = false;
+            service = null;
+        }
+        super.onStop();
     }
 
     private android.view.View spacer(int height) {
@@ -275,48 +312,7 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
         return view;
     }
 
-    private void saveUploadConfig() {
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_URL, urlInput.getText().toString().trim())
-                .putString(KEY_TOKEN, tokenInput.getText().toString().trim())
-                .apply();
-        applyUploadConfig();
-        uploadStatusView.setText(uploader.isConfigured()
-                ? "upload: configured — tap Test upload"
-                : "upload: disabled (enter both URL and token, then Save)");
-    }
-
-    private void applyUploadConfig() {
-        uploader.configure(urlInput.getText().toString(), tokenInput.getText().toString());
-    }
-
-    private void reset(String scanState) {
-        deviceView.setText("device: (none)");
-        connectionView.setText("status: idle");
-        bpmView.setText("--");
-        updatedView.setText("updated: --");
-        countView.setText("notifications received: 0");
-        scanStateView.setText(scanState);
-        uploadStatusView.setText(uploader.isConfigured()
-                ? "upload: configured"
-                : "upload: disabled (enter both URL and token, then Save)");
-        realtimeView.setText("realtime HR: connect to the band to see 0x2A39 status");
-        rateView.setText("rate: --");
-        notificationCount = 0;
-        uploadOk = 0;
-        uploadFail = 0;
-        recentReadings.clear();
-    }
-
-    private void stopRepeatingStart() {
-        if (!repeatingStart) {
-            return;
-        }
-        repeatingStart = false;
-        repeatHandler.removeCallbacks(repeatStart);
-        repeatStartButton.setText("Repeat start every 1s: OFF");
-    }
+    // ------------------------------------------------------------------ permissions
 
     private void requestMissingPermissions() {
         List<String> missing = new ArrayList<>();
@@ -326,10 +322,15 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
                 missing.add(permission);
             }
         }
-        if (missing.isEmpty()) {
-            client.startScan();
-        } else {
-            scanStateView.setText("Requesting permissions...");
+        // Being denied this only hides the notification; the service still runs, so a
+        // refusal is not treated as fatal.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            missing.add(android.Manifest.permission.POST_NOTIFICATIONS);
+        }
+
+        if (!missing.isEmpty()) {
             requestPermissions(missing.toArray(new String[0]), REQUEST_PERMISSIONS);
         }
     }
@@ -338,25 +339,13 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode != REQUEST_PERMISSIONS) {
-            return;
-        }
-        boolean allGranted = grantResults.length > 0;
-        for (int result : grantResults) {
-            if (result != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                allGranted = false;
-                break;
-            }
-        }
-        if (allGranted) {
-            client.startScan();
-        } else {
+        if (requestCode == REQUEST_PERMISSIONS && !BleHrClient.hasScanPermission(this)) {
             scanStateView.setText("Bluetooth permissions denied — grant them in Settings "
                     + "(on Android 12+: Nearby devices).");
         }
     }
 
-    // ------------------------------------------------------------------ BleHrClient.Listener
+    // ------------------------------------------------------------------ Listener
 
     @Override
     public void onScanState(String state) {
@@ -377,89 +366,51 @@ public class MainActivity extends Activity implements BleHrClient.Listener,
     }
 
     @Override
-    public void onConnectionState(String state) {
-        runOnUiThread(() -> connectionView.setText("status: " + state));
-    }
-
-    @Override
-    public void onHeartRate(int bpm, long timestamp) {
+    public void onStatus(HrMonitorService.Status status) {
         runOnUiThread(() -> {
-            notificationCount++;
-            bpmView.setText(String.valueOf(bpm));
-            updatedView.setText("updated: " + timeFormat.format(new Date(timestamp)));
-            countView.setText("notifications received: " + notificationCount);
-            rateView.setText("rate: " + describeRate(timestamp));
-        });
+            serviceView.setText(status.monitoring
+                    ? "service: running (foreground) — survives this screen closing"
+                    : "service: idle — nothing is being read");
+            deviceView.setText("device: " + status.deviceLabel);
+            connectionView.setText("status: " + status.connection);
+            bpmView.setText(status.bpm >= 0 ? String.valueOf(status.bpm) : "--");
+            updatedView.setText(status.measuredAt > 0
+                    ? "updated: " + timeFormat.format(new Date(status.measuredAt))
+                    : "updated: --");
+            countView.setText("notifications received: " + status.notifications);
+            rateView.setText(describeRate(status.measuredAt));
+            realtimeView.setText(status.realtime);
+            uploadStatusView.setText(status.upload);
+            calibrationView.setText(status.calibration);
 
-        // Fire-and-forget; returns immediately and never touches the BLE path.
-        uploader.submit(bpm, timestamp);
+            startButton.setEnabled(!status.monitoring);
+            stopButton.setEnabled(status.monitoring);
+        });
     }
 
     /**
-     * How often 0x2A37 is actually arriving, over a trailing window. This is the
-     * number the whole experiment turns on: occasional means the band is measuring
-     * on its own schedule, roughly 1/s means the start command took effect.
+     * Arrivals per second over a trailing window, computed from the timestamps the
+     * readings carry. Repeated status updates that report the same reading do not
+     * disturb it.
      */
-    private String describeRate(long now) {
-        recentReadings.addLast(now);
+    private String describeRate(long measuredAt) {
+        if (measuredAt <= 0 || measuredAt == lastRateSample) {
+            return rateText;
+        }
+        lastRateSample = measuredAt;
+
+        recentReadings.addLast(measuredAt);
         while (!recentReadings.isEmpty()
-                && now - recentReadings.peekFirst() > RATE_WINDOW_MS) {
+                && measuredAt - recentReadings.peekFirst() > RATE_WINDOW_MS) {
             recentReadings.removeFirst();
         }
 
         int count = recentReadings.size();
-        long span = count < 2 ? 0 : now - recentReadings.peekFirst();
-        if (span <= 0) {
-            return "just started (" + count + " reading)";
-        }
-        return String.format(Locale.US, "%.2f/s  (%d readings in %ds)",
-                count * 1000.0 / span, count, span / 1000);
-    }
-
-    @Override
-    public void onRealtimeHr(String state) {
-        runOnUiThread(() -> realtimeView.setText("realtime HR: " + state));
-    }
-
-    // ------------------------------------------------------- HeartRateUploader.Listener
-
-    @Override
-    public void onUploadResult(boolean ok, String detail) {
-        runOnUiThread(() -> {
-            if (ok) {
-                uploadOk++;
-            } else {
-                uploadFail++;
-            }
-            uploadStatusView.setText("upload: " + (ok ? "OK" : "FAILED") + " " + detail
-                    + "   [ok=" + uploadOk + " fail=" + uploadFail + "]");
-        });
-    }
-
-    @Override
-    public void onCalibrationResult(long clockOffsetMs, long rttMs, long uncertaintyMs) {
-        runOnUiThread(() -> calibrationView.setText(String.format(Locale.US,
-                "clock_offset = %d ms (%+.2f s)\nrtt = %d ms\nuncertainty = ± %d ms",
-                clockOffsetMs, clockOffsetMs / 1000.0, rttMs, uncertaintyMs)));
-    }
-
-    @Override
-    public void onCalibrationFailed(String detail) {
-        runOnUiThread(() -> calibrationView.setText("calibration failed: " + detail));
-    }
-
-    // ------------------------------------------------------------------ lifecycle
-
-    @Override
-    protected void onDestroy() {
-        stopRepeatingStart();
-        repeatHandler.removeCallbacksAndMessages(null);
-        if (client != null) {
-            client.shutdown();
-        }
-        if (uploader != null) {
-            uploader.shutdown();
-        }
-        super.onDestroy();
+        long span = count < 2 ? 0 : measuredAt - recentReadings.peekFirst();
+        rateText = span <= 0
+                ? "rate: just started (" + count + " reading)"
+                : String.format(Locale.US, "rate: %.2f/s  (%d readings in %ds)",
+                        count * 1000.0 / span, count, span / 1000);
+        return rateText;
     }
 }

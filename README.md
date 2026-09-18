@@ -70,8 +70,16 @@ the band, open its heart-rate screen, or turn on whole-day HR measurement.
 
 | Android | Permissions |
 |---|---|
-| 12+ (API 31+) | `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT` |
+| 13+ (API 33+) | `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT`, `POST_NOTIFICATIONS` |
+| 12 (API 31–32) | `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT` |
 | 6–11 (API 23–30) | `ACCESS_FINE_LOCATION` (+ legacy `BLUETOOTH`, `BLUETOOTH_ADMIN`) |
+
+`POST_NOTIFICATIONS` is requested on 13+ but **is not treated as fatal**. Denying it hides
+the foreground service's notification; the service itself still runs and still uploads, so
+a refusal does not block monitoring.
+
+`FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_CONNECTED_DEVICE` are declared as well — see
+[Running in the background](#running-in-the-background).
 
 `BLUETOOTH_SCAN` carries `neverForLocation` — the app makes no location claim, and the
 location permission is kept off Android 12+ entirely.
@@ -131,6 +139,65 @@ update time · number of notifications received.
 
 The notification counter is the quickest way to tell "subscribed but silent" apart from
 "never subscribed".
+
+## Running in the background
+
+Monitoring lives in a **foreground service** (`HrMonitorService`), not in the Activity.
+Before that split, `MainActivity.onDestroy` shut the BLE client and the uploader down, so
+closing the screen stopped the readings — the band was only ever observed while somebody
+was looking at it.
+
+| | Owns |
+|---|---|
+| `MainActivity` | picking the band once, Start/Stop monitoring, rendering state |
+| `HrMonitorService` | scanning, connecting, subscribing, reconnecting, uploading, the realtime-HR command |
+
+The Activity binds while it is visible and clears its listener before unbinding, so a
+running service never holds a dead Activity and the Activity never keeps the service
+alive.
+
+**The service is a `connectedDevice` foreground service.** On Android 14 (API 34) that
+type is not optional — `startForeground()` throws
+`MissingForegroundServiceTypeException` without it. The type also requires
+`FOREGROUND_SERVICE_CONNECTED_DEVICE`, satisfied here by holding `BLUETOOTH_SCAN` and
+`BLUETOOTH_CONNECT`.
+
+Two details worth knowing if you change this code:
+
+- **`startForeground()` is called before any validation** in the `ACTION_START` path. The
+  caller used `startForegroundService()`, and returning from `onStartCommand` without ever
+  promoting — even on an error path like "no device chosen" — is what Android answers with
+  a `RemoteServiceException`.
+- **`startForeground()` is wrapped in a try/catch.** Android 12+ refuses a foreground start
+  from the background, which is exactly what a `START_STICKY` restart after a kill looks
+  like, and that path has been reported to misfire on 14 and 15. Losing the service is
+  recoverable; letting the exception escape takes the whole process with it.
+
+Reconnect backoff runs 2 s → 4 s → 8 s → 16 s → 32 s → 60 s, and is driven by
+`BleHrClient.Listener.onLinkState` rather than by parsing the status text. The link counts
+as up only once the `0x2A37` CCCD write has succeeded: a GATT connection with no
+subscription delivers no readings, so treating it as connected would mean never retrying.
+
+The band is remembered by address in `SharedPreferences`, which is what lets a reconnect
+happen without a scan and with nobody present to pick from a list. No address is compiled
+in.
+
+### What survives what
+
+| Event | Behaviour |
+|---|---|
+| Activity closed / Home pressed | Keeps running, keeps uploading |
+| Swiped out of recents | `android:stopWithTask="false"` means the system does not stop the service |
+| BLE link drops | Reconnects on the backoff schedule above |
+| Process killed by the system | `START_STICKY` asks for a restart; if one comes it resumes only when monitoring was on |
+| Monitoring stopped by the user, then process killed | Does **not** resume — the flag is cleared on stop |
+| Phone rebooted | Nothing. There is no `BOOT_COMPLETED` receiver by design |
+
+**Being killed is not fully preventable.** On aggressive vendor ROMs — vivo/Funtouch among
+them — the service can still be reaped unless the app is allowed to run in the background
+in the system settings (vivo: *Battery → high background power consumption*, and
+*Autostart*). Turning off battery optimisation for the app helps on stock Android and is
+the only lever the app has by itself.
 
 ## Starting continuous heart-rate measurement from the app
 
@@ -297,6 +364,9 @@ URL (`.../wearable/heart-rate` → `.../wearable/time`) rather than configured s
 | Start write returns `0` but **no** readings follow | The write reached the GATT server but the firmware did not act on it — try **Repeat start every 1s** |
 | Readings stop ~27 s after a single start | Expected: the band's own measurement timeout. Use **Repeat start every 1s**, or just start again |
 | Rate is ~0.35/s rather than ~1/s | Expected on this band — see the measured table above |
+| Readings stop when the app is closed | The service is not running — press **Start monitoring**. If it was running, the OS killed it; see the vendor-ROM note above |
+| Service stops a while after leaving the app | Battery optimisation or the vendor's background restrictions. Whitelist the app |
+| Notification missing but readings continue | `POST_NOTIFICATIONS` denied. The service still runs; grant it to get the notification back |
 | Notifications stop after a while | The band went idle, or Gadgetbridge reconnected and took the link |
 
 In every failure case the app dumps the full service/characteristic map to logcat. It does
@@ -307,7 +377,8 @@ for this stage.
 
 ```
 app/src/main/java/com/example/hrble/
-  MainActivity.java        UI + runtime permission flow + upload configuration + realtime HR controls
+  MainActivity.java        binds to the service; device picker, Start/Stop, status rendering
+  HrMonitorService.java    foreground service: owns BLE lifecycle, reconnect, upload, 0x2A39
   BleHrClient.java         scan / connect / discoverServices / subscribe / parse dispatch / 0x2A39 writes
   HrParser.java            UUID constants, 0x2A37 flag parsing, pretty-printing
   HeartRateUploader.java   coalescing fire-and-forget HTTPS POST

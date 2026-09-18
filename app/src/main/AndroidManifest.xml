@@ -35,6 +35,23 @@
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!--
+        Monitoring has to survive the Activity going away, so it runs in a foreground
+        service of type connectedDevice. On Android 14 (API 34) that type is mandatory:
+        startForeground() throws MissingForegroundServiceTypeException without it.
+
+        FOREGROUND_SERVICE_CONNECTED_DEVICE is the API 34 runtime prerequisite; it is
+        satisfied because the app also holds BLUETOOTH_SCAN and BLUETOOTH_CONNECT.
+
+        POST_NOTIFICATIONS is requested at runtime on 13+. Being denied it does not stop
+        the service - it only makes the notification invisible - so a refusal is not
+        treated as a failure to start.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="false"
         android:label="HR BLE PoC"
@@ -48,6 +65,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            stopWithTask="false" is the default and is set explicitly because it is the
+            whole point: swiping the app out of the recents list must not stop the
+            service. onTaskRemoved() is deliberately not implemented for the same
+            reason - there is nothing to clean up, the BLE link outlives the task.
+        -->
+        <service
+            android:name=".HrMonitorService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="connectedDevice" />
 
     </application>
 

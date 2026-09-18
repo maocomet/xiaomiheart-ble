@@ -65,6 +65,16 @@ public class BleHrClient {
          * control-point result never overwrites the connection status line.
          */
         void onRealtimeHr(String state);
+
+        /**
+         * Structured link state: true once the heart-rate subscription is actually
+         * live, false whenever the link drops or the subscription fails.
+         *
+         * Separate from {@link #onConnectionState} because that one is prose meant for
+         * a status line. The foreground service drives its reconnect backoff from this,
+         * and parsing display text to decide whether to retry would be a trap.
+         */
+        void onLinkState(boolean up, String detail);
     }
 
     /** A scan result, ranked so the likeliest band sorts to the top. */
@@ -327,30 +337,82 @@ public class BleHrClient {
         if (candidate == null) {
             return;
         }
+        String label = (candidate.name == null || candidate.name.isEmpty())
+                ? candidate.address : candidate.name;
+        connectDevice(candidate.device, label);
+    }
+
+    /**
+     * Connects to a band whose address was stored earlier, without scanning.
+     *
+     * The foreground service uses this when reconnecting after a drop: there is no UI
+     * to pick from, and re-running a 20 s scan on every retry would be both slower and
+     * harder on the battery. The address is whatever the user picked in the scan list —
+     * nothing is compiled in.
+     */
+    public void connectToAddress(String address) {
+        stopScan();
+
+        if (address == null || address.trim().isEmpty()) {
+            linkDown("no saved device address");
+            return;
+        }
+
+        BluetoothManager manager =
+                (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+        BluetoothAdapter adapter = manager == null ? null : manager.getAdapter();
+        if (adapter == null) {
+            linkDown("Bluetooth unavailable");
+            return;
+        }
+
+        BluetoothDevice device;
+        try {
+            device = adapter.getRemoteDevice(address.trim());
+        } catch (IllegalArgumentException e) {
+            linkDown("not a valid device address: " + address);
+            return;
+        }
+        connectDevice(device, address.trim());
+    }
+
+    private void connectDevice(BluetoothDevice device, String label) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                 && context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
                 != PackageManager.PERMISSION_GRANTED) {
-            listener.onConnectionState("missing connect permission");
+            linkDown("missing connect permission");
             return;
         }
 
         closeGatt();
 
-        String label = (candidate.name == null || candidate.name.isEmpty())
-                ? candidate.address : candidate.name;
         listener.onConnectionState("connecting to " + label + " ...");
-        Log.i(TAG, "connectGatt " + candidate.address);
+        Log.i(TAG, "connectGatt " + label);
 
-        gatt = candidate.device.connectGatt(context, false, gattCallback,
+        gatt = device.connectGatt(context, false, gattCallback,
                 BluetoothDevice.TRANSPORT_LE);
         if (gatt == null) {
-            listener.onConnectionState("connectGatt() returned null");
+            linkDown("connectGatt() returned null");
         }
     }
 
     public void disconnect() {
         closeGatt();
-        listener.onConnectionState("disconnected by user");
+        linkDown("disconnected by user");
+    }
+
+    /**
+     * The two halves are emitted together everywhere the link genuinely comes up or
+     * goes down, so a caller can never see one without the other.
+     */
+    private void linkUp(String detail) {
+        listener.onConnectionState(detail);
+        listener.onLinkState(true, detail);
+    }
+
+    private void linkDown(String detail) {
+        listener.onConnectionState(detail);
+        listener.onLinkState(false, detail);
     }
 
     private void closeGatt() {
@@ -388,7 +450,7 @@ public class BleHrClient {
                 String state = "connection error: status=" + status
                         + " (" + gattStatusName(status) + "), newState=" + newState;
                 Log.w(TAG, state);
-                listener.onConnectionState(state);
+                linkDown(state);
                 closeGatt();
                 return;
             }
@@ -397,10 +459,10 @@ public class BleHrClient {
                 listener.onConnectionState("connected — discovering services...");
                 boolean started = g.discoverServices();
                 if (!started) {
-                    listener.onConnectionState("discoverServices() returned false");
+                    linkDown("discoverServices() returned false");
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                listener.onConnectionState("disconnected");
+                linkDown("disconnected");
                 closeGatt();
             }
         }
@@ -412,22 +474,21 @@ public class BleHrClient {
             dumpServices(g, status);
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                listener.onConnectionState("service discovery failed: status=" + status);
+                linkDown("service discovery failed: status=" + status);
                 return;
             }
 
             BluetoothGattService hrService =
                     g.getService(UUID.fromString(HrParser.UUID_HR_SERVICE));
             if (hrService == null) {
-                listener.onConnectionState(
-                        "Heart Rate service 0x180D NOT found — full service map in logcat");
+                linkDown("Heart Rate service 0x180D NOT found — full service map in logcat");
                 return;
             }
 
             BluetoothGattCharacteristic hrCharacteristic =
                     hrService.getCharacteristic(UUID.fromString(HrParser.UUID_HR_MEASUREMENT));
             if (hrCharacteristic == null) {
-                listener.onConnectionState("0x2A37 not present inside 0x180D");
+                linkDown("0x2A37 not present inside 0x180D");
                 return;
             }
 
@@ -443,10 +504,11 @@ public class BleHrClient {
             }
             Log.i(TAG, "CCCD write status=" + status);
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                listener.onConnectionState(
-                        "CCCD written — waiting for heart rate notifications");
+                // The subscription is live: this, not the connection, is what the
+                // service treats as "up".
+                linkUp("CCCD written — waiting for heart rate notifications");
             } else {
-                listener.onConnectionState("CCCD write failed: status=" + status
+                linkDown("CCCD write failed: status=" + status
                         + " (" + gattStatusName(status) + ")");
             }
         }
@@ -508,7 +570,7 @@ public class BleHrClient {
         Log.i(TAG, "0x2A37 properties: " + HrParser.describeProperties(properties));
 
         if (!supportsNotify && !supportsIndicate) {
-            listener.onConnectionState("0x2A37 supports neither NOTIFY nor INDICATE: "
+            linkDown("0x2A37 supports neither NOTIFY nor INDICATE: "
                     + HrParser.describeProperties(properties));
             return;
         }
@@ -516,15 +578,14 @@ public class BleHrClient {
         boolean enabled = g.setCharacteristicNotification(hrCharacteristic, true);
         Log.i(TAG, "setCharacteristicNotification -> " + enabled);
         if (!enabled) {
-            listener.onConnectionState("setCharacteristicNotification() returned false");
+            linkDown("setCharacteristicNotification() returned false");
             return;
         }
 
         BluetoothGattDescriptor cccd =
                 hrCharacteristic.getDescriptor(UUID.fromString(HrParser.UUID_CCCD));
         if (cccd == null) {
-            listener.onConnectionState(
-                    "CCCD (0x2902) missing on 0x2A37 — cannot subscribe");
+            linkDown("CCCD (0x2902) missing on 0x2A37 — cannot subscribe");
             return;
         }
 
@@ -547,7 +608,9 @@ public class BleHrClient {
                     + ") -> " + queued);
         }
         if (!queued) {
-            listener.onConnectionState("CCCD write could not be queued");
+            // No callback is coming if the write never left, so the link is definitely
+            // not up — say so rather than waiting for a notification that will not come.
+            linkDown("CCCD write could not be queued");
         }
     }
 
